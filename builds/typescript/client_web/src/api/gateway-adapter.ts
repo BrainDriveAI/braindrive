@@ -9,8 +9,13 @@ import {
   type ChatEvent,
   type Conversation,
   type ConversationDetail,
+  type ContextWindowWarning,
   type GatewayCredentialUpdateRequest,
   type GatewayCredentialUpdateResponse,
+  type GatewayMemoryBackupRestoreRequest,
+  type GatewayMemoryBackupRestoreResponse,
+  type GatewayMemoryBackupRunResponse,
+  type GatewayMemoryBackupSettingsUpdateRequest,
   type GatewayMigrationImportResult,
   type GatewayModelCatalog,
   type GatewayOnboardingStatus,
@@ -35,6 +40,7 @@ type ConversationListResponse = {
 type SendMessageOptions = {
   signal?: AbortSignal;
   metadata?: Record<string, unknown>;
+  onContextWarning?: (warning: ContextWindowWarning) => void;
 };
 
 type ErrorPayload = {
@@ -215,6 +221,32 @@ function normalizeChatEventPayload(eventName: string, parsed: unknown): unknown 
   return withType;
 }
 
+function parseContextWindowWarning(headers: Headers): ContextWindowWarning | null {
+  if (headers.get("x-context-window-warning") !== "1") {
+    return null;
+  }
+
+  const estimatedTokens = Number.parseInt(headers.get("x-context-window-estimated-tokens") ?? "", 10);
+  const budgetTokens = Number.parseInt(headers.get("x-context-window-budget-tokens") ?? "", 10);
+  const ratio = Number.parseFloat(headers.get("x-context-window-ratio") ?? "");
+  const threshold = Number.parseFloat(headers.get("x-context-window-threshold") ?? "");
+  const managed = headers.get("x-context-window-managed") === "1";
+  const message = headers.get("x-context-window-message") ?? "This session is getting long.";
+
+  if (!Number.isFinite(estimatedTokens) || !Number.isFinite(budgetTokens) || !Number.isFinite(ratio)) {
+    return null;
+  }
+
+  return {
+    estimated_tokens: estimatedTokens,
+    budget_tokens: budgetTokens,
+    ratio,
+    threshold: Number.isFinite(threshold) ? threshold : 0.8,
+    managed,
+    message,
+  };
+}
+
 export async function* sendMessage(
   conversationId: string | null,
   content: string,
@@ -239,6 +271,11 @@ export async function* sendMessage(
 
   if (!response.ok) {
     throw await toGatewayError(response);
+  }
+
+  const contextWarning = parseContextWindowWarning(response.headers);
+  if (contextWarning) {
+    options.onContextWarning?.(contextWarning);
   }
 
   for await (const event of parseSSE(response)) {
@@ -542,6 +579,52 @@ export async function updateSettings(
   }
 
   return (await response.json()) as GatewaySettings;
+}
+
+export async function updateMemoryBackupSettings(
+  payload: GatewayMemoryBackupSettingsUpdateRequest
+): Promise<GatewaySettings> {
+  const response = await authenticatedFetch(`${GATEWAY_BASE_URL}/settings/memory-backup`, {
+    method: "PUT",
+    headers: withLocalOwnerHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw await toGatewayError(response);
+  }
+
+  return (await response.json()) as GatewaySettings;
+}
+
+export async function runMemoryBackupNow(): Promise<GatewayMemoryBackupRunResponse> {
+  const response = await authenticatedFetch(`${GATEWAY_BASE_URL}/settings/memory-backup/save`, {
+    method: "POST",
+    headers: withLocalOwnerHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({}),
+  });
+
+  if (!response.ok) {
+    throw await toGatewayError(response);
+  }
+
+  return (await response.json()) as GatewayMemoryBackupRunResponse;
+}
+
+export async function restoreMemoryBackup(
+  payload: GatewayMemoryBackupRestoreRequest = {}
+): Promise<GatewayMemoryBackupRestoreResponse> {
+  const response = await authenticatedFetch(`${GATEWAY_BASE_URL}/settings/memory-backup/restore`, {
+    method: "POST",
+    headers: withLocalOwnerHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    throw await toGatewayError(response);
+  }
+
+  return (await response.json()) as GatewayMemoryBackupRestoreResponse;
 }
 
 export async function getOwnerProfile(): Promise<string | null> {

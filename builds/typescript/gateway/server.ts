@@ -32,7 +32,13 @@ import {
   readBootstrapPrompt,
   savePreferences,
 } from "../config.js";
-import type { AdapterConfig, ClientMessageRequest, Preferences, RuntimeConfig } from "../contracts.js";
+import type {
+  AdapterConfig,
+  ApprovalMode,
+  ClientMessageRequest,
+  Preferences,
+  RuntimeConfig
+} from "../contracts.js";
 import { runAgentLoop } from "../engine/loop.js";
 import { classifyProviderError } from "../engine/errors.js";
 import { formatSseEvent } from "../engine/stream.js";
@@ -43,6 +49,7 @@ import { ensureAuthState, saveAuthState } from "../memory/auth-state.js";
 import type { ConversationRepository } from "../memory/conversation-repository.js";
 import { MarkdownConversationStore } from "../memory/conversation-store-markdown.js";
 import { exportMemory } from "../memory/export.js";
+import { restoreMemoryBackup } from "../memory/backup-restore.js";
 import { importMigrationArchive } from "../memory/migration.js";
 import {
   createSupportBundle,
@@ -56,8 +63,10 @@ import { initializeMasterKey, loadMasterKey } from "../secrets/key-provider.js";
 import { resolveSecretsPaths } from "../secrets/paths.js";
 import { getVaultSecret, upsertVaultSecret } from "../secrets/vault.js";
 import { GatewayConversationService } from "./conversations.js";
+import { createMemoryBackupScheduler } from "./memory-backup-scheduler.js";
 import { GatewayProjectService, isProjectMetadata, ProtectedProjectError } from "./projects.js";
 import { GatewaySkillService } from "./skills.js";
+import { prepareContextWindow } from "./context-window.js";
 
 const approvalDecisionSchema = z.object({
   decision: z.enum(["approved", "denied"]),
@@ -154,6 +163,33 @@ const settingsCredentialsUpdateSchema = z
     }
   });
 
+const memoryBackupFrequencySchema = z.enum(["manual", "after_changes", "hourly", "daily"]);
+
+const settingsMemoryBackupUpdateSchema = z
+  .object({
+    repository_url: z.string().trim().url(),
+    frequency: memoryBackupFrequencySchema,
+    git_token: z.string().trim().min(1).optional(),
+    token_secret_ref: z.string().trim().min(1).optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const repositoryUrlError = validateMemoryBackupRepositoryUrl(value.repository_url);
+    if (repositoryUrlError) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: repositoryUrlError,
+        path: ["repository_url"],
+      });
+    }
+  });
+
+const settingsMemoryBackupRestoreSchema = z
+  .object({
+    target_commit: z.string().trim().min(1).optional(),
+  })
+  .strict();
+
 const authCredentialsSchema = z
   .object({
     identifier: z.string().trim().min(1),
@@ -190,6 +226,8 @@ const MANAGED_PROXY_ROUTES = new Set([
   "/account/portal-session",
   "/account/topup",
 ]);
+
+const DEFAULT_MEMORY_BACKUP_TOKEN_SECRET_REF = "backup/git/token";
 
 export async function buildServer(rootDir = process.cwd()) {
   const isManaged = process.env.BD_DEPLOYMENT_MODE === "managed";
@@ -304,6 +342,14 @@ export async function buildServer(rootDir = process.cwd()) {
         })
       : null;
   let migrationInProgress = false;
+  const memoryBackupScheduler = createMemoryBackupScheduler({
+    memoryRoot: runtimeConfig.memory_root,
+    isMigrationInProgress: () => migrationInProgress,
+  });
+  await memoryBackupScheduler.initialize();
+  app.addHook("onClose", async () => {
+    memoryBackupScheduler.close();
+  });
 
   app.get("/health", async () => ({ status: "ok" }));
 
@@ -551,19 +597,54 @@ export async function buildServer(rootDir = process.cwd()) {
       : "";
     const finalPrompt = promptWithSkills.prompt + projectContext;
 
+    const correlationId = crypto.randomUUID();
+    const contextWindow = await prepareContextWindow({
+      memoryRoot: runtimeConfig.memory_root,
+      conversationId,
+      correlationId,
+      messages: conversations.buildConversationMessages(conversationId, finalPrompt),
+      tools: toolExecutor.listTools(request.authContext),
+    });
+
+    auditLog("context.window", {
+      conversation_id: conversationId,
+      estimated_prompt_tokens_before: contextWindow.usage.estimatedPromptTokensBefore,
+      estimated_prompt_tokens_after: contextWindow.usage.estimatedPromptTokensAfter,
+      budget_tokens: contextWindow.usage.budgetTokens,
+      ratio_before: Number(contextWindow.usage.ratioBefore.toFixed(3)),
+      ratio_after: Number(contextWindow.usage.ratioAfter.toFixed(3)),
+      warning_threshold: contextWindow.usage.threshold,
+      dropped_units: contextWindow.usage.droppedUnits,
+      dropped_messages: contextWindow.usage.droppedMessages,
+      summary_applied: contextWindow.usage.summaryApplied,
+      summary_artifact_path: contextWindow.usage.summaryArtifactPath,
+      summary_artifact_write_error: contextWindow.usage.summaryArtifactWriteError,
+    });
+
     const engineRequest = gatewayAdapter.buildEngineRequest({
       conversationId,
-      correlationId: crypto.randomUUID(),
-      messages: conversations.buildConversationMessages(conversationId, finalPrompt),
+      correlationId,
+      messages: contextWindow.messages,
       ...(body.metadata ? { clientMetadata: body.metadata } : {}),
     });
 
-    reply.raw.writeHead(200, {
+    const streamHeaders: Record<string, string> = {
       "content-type": "text/event-stream",
       "cache-control": "no-cache",
       connection: "keep-alive",
       "x-conversation-id": conversationId,
-    });
+    };
+    if (contextWindow.warning) {
+      streamHeaders["x-context-window-warning"] = "1";
+      streamHeaders["x-context-window-estimated-tokens"] = String(contextWindow.warning.estimated_tokens);
+      streamHeaders["x-context-window-budget-tokens"] = String(contextWindow.warning.budget_tokens);
+      streamHeaders["x-context-window-ratio"] = String(contextWindow.warning.ratio);
+      streamHeaders["x-context-window-threshold"] = String(contextWindow.warning.threshold);
+      streamHeaders["x-context-window-managed"] = contextWindow.warning.managed ? "1" : "0";
+      streamHeaders["x-context-window-message"] = contextWindow.warning.message;
+    }
+
+    reply.raw.writeHead(200, streamHeaders);
 
     let assistantBuffer = "";
     let currentAssistantMessageId = crypto.randomUUID();
@@ -598,6 +679,7 @@ export async function buildServer(rootDir = process.cwd()) {
         request.authContext,
         {
           memoryRoot: runtimeConfig.memory_root,
+          approvalMode: livePreferences.approval_mode,
           safetyIterationLimit: runtimeConfig.safety_iteration_limit,
         }
       )) {
@@ -1199,6 +1281,140 @@ export async function buildServer(rootDir = process.cwd()) {
 
     await savePreferences(runtimeConfig.memory_root, nextPreferences);
     reply.send(buildSettingsPayload(adapterConfig, nextPreferences));
+  });
+
+  app.put("/settings/memory-backup", async (request, reply) => {
+    authorize(request.authContext, "administration");
+    const parsed = settingsMemoryBackupUpdateSchema.safeParse(request.body);
+    if (!parsed.success) {
+      sendInvalidRequest(reply, "/settings/memory-backup", parsed.error.issues.length);
+      return;
+    }
+
+    const body = parsed.data;
+    const currentPreferences = await loadPreferences(runtimeConfig.memory_root);
+    const currentBackup = currentPreferences.memory_backup;
+    const hasExistingTokenReference = Boolean(
+      currentBackup?.token_secret_ref && currentBackup.token_secret_ref.trim().length > 0
+    );
+    if (!body.git_token && !hasExistingTokenReference) {
+      sendInvalidRequest(reply, "/settings/memory-backup", 1);
+      return;
+    }
+
+    const tokenSecretRef = body.git_token
+      ? body.token_secret_ref?.trim() ||
+        currentBackup?.token_secret_ref?.trim() ||
+        DEFAULT_MEMORY_BACKUP_TOKEN_SECRET_REF
+      : currentBackup?.token_secret_ref?.trim() || DEFAULT_MEMORY_BACKUP_TOKEN_SECRET_REF;
+
+    if (body.git_token) {
+      const normalizedToken = body.git_token.trim();
+      const paths = resolveSecretsPaths();
+      let masterKey;
+      try {
+        masterKey = await loadMasterKey(paths);
+      } catch {
+        await initializeMasterKey({ paths });
+        masterKey = await loadMasterKey(paths);
+      }
+      await upsertVaultSecret(tokenSecretRef, normalizedToken, masterKey, paths);
+    }
+
+    const nextPreferences: Preferences = {
+      ...currentPreferences,
+      memory_backup: {
+        repository_url: body.repository_url,
+        frequency: body.frequency,
+        token_secret_ref: tokenSecretRef,
+        ...(currentBackup?.last_save_at ? { last_save_at: currentBackup.last_save_at } : {}),
+        ...(currentBackup?.last_attempt_at ? { last_attempt_at: currentBackup.last_attempt_at } : {}),
+        ...(currentBackup?.last_result ? { last_result: currentBackup.last_result } : {}),
+        ...(currentBackup?.last_error !== undefined ? { last_error: currentBackup.last_error } : {}),
+      },
+    };
+
+    await savePreferences(runtimeConfig.memory_root, nextPreferences);
+    await memoryBackupScheduler.reconfigure();
+    auditLog("settings.memory_backup_update", {
+      actor_id: request.authContext.actorId,
+      repository_host: tryParseUrl(body.repository_url)?.host ?? "unknown",
+      frequency: body.frequency,
+      token_secret_ref: tokenSecretRef,
+      token_rotated: Boolean(body.git_token),
+    });
+    reply.send(buildSettingsPayload(adapterConfig, nextPreferences));
+  });
+
+  app.post("/settings/memory-backup/save", async (request, reply) => {
+    authorize(request.authContext, "administration");
+    const currentPreferences = await loadPreferences(runtimeConfig.memory_root);
+    if (!currentPreferences.memory_backup) {
+      sendInvalidRequest(reply, "/settings/memory-backup/save", 1);
+      return;
+    }
+
+    const { result, preferences: nextPreferences } = await memoryBackupScheduler.triggerManualBackup();
+    auditLog("settings.memory_backup_save", {
+      actor_id: request.authContext.actorId,
+      result: result.result,
+      attempted_at: result.attempted_at,
+      saved_at: result.saved_at,
+      message: result.message,
+    });
+
+    reply.send({
+      result,
+      settings: buildSettingsPayload(adapterConfig, nextPreferences),
+    });
+  });
+
+  app.post("/settings/memory-backup/restore", async (request, reply) => {
+    authorize(request.authContext, "administration");
+    const parsed = settingsMemoryBackupRestoreSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      sendInvalidRequest(reply, "/settings/memory-backup/restore", parsed.error.issues.length);
+      return;
+    }
+    const currentPreferences = await loadPreferences(runtimeConfig.memory_root);
+    if (!currentPreferences.memory_backup) {
+      sendInvalidRequest(reply, "/settings/memory-backup/restore", 1);
+      return;
+    }
+    if (migrationInProgress) {
+      reply.code(409).send({ error: "migration_in_progress" });
+      return;
+    }
+
+    migrationInProgress = true;
+    try {
+      const result = await restoreMemoryBackup(runtimeConfig.memory_root, currentPreferences, {
+        targetCommit: parsed.data.target_commit,
+      });
+      const refreshedPreferences = await loadPreferences(runtimeConfig.memory_root);
+      auditLog("settings.memory_backup_restore", {
+        actor_id: request.authContext.actorId,
+        commit: result.commit,
+        source_branch: result.source_branch,
+        warnings_count: result.warnings.length,
+        target_commit_requested: parsed.data.target_commit ?? null,
+      });
+      reply.send({
+        result,
+        settings: buildSettingsPayload(adapterConfig, refreshedPreferences),
+      });
+    } catch (error) {
+      const safeMessage = error instanceof Error ? error.message : "Memory restore failed";
+      auditLog("settings.memory_backup_restore_failed", {
+        actor_id: request.authContext.actorId,
+        message: safeMessage,
+      });
+      reply.code(400).send({
+        error: safeMessage,
+      });
+    } finally {
+      migrationInProgress = false;
+    }
   });
 
   app.put("/settings/credentials", async (request, reply) => {
@@ -1999,12 +2215,46 @@ function isInvalidSkillMutationError(error: unknown): boolean {
   );
 }
 
+function validateMemoryBackupRepositoryUrl(repositoryUrl: string): string | null {
+  if (looksLikeSshRepositoryUrl(repositoryUrl)) {
+    return "Only https:// repository URLs are supported";
+  }
+
+  const parsed = tryParseUrl(repositoryUrl);
+  if (!parsed) {
+    return "Repository URL must be a valid URL";
+  }
+
+  if (parsed.protocol !== "https:") {
+    return "Only https:// repository URLs are supported";
+  }
+
+  if (parsed.username || parsed.password) {
+    return "Repository URL cannot include embedded credentials";
+  }
+
+  return null;
+}
+
+function looksLikeSshRepositoryUrl(repositoryUrl: string): boolean {
+  const normalized = repositoryUrl.trim().toLowerCase();
+  return normalized.startsWith("ssh://") || normalized.startsWith("git@");
+}
+
+function tryParseUrl(repositoryUrl: string): URL | null {
+  try {
+    return new URL(repositoryUrl);
+  } catch {
+    return null;
+  }
+}
+
 function buildSettingsPayload(
   adapterConfig: AdapterConfig,
   preferences: Preferences
 ): {
   default_model: string;
-  approval_mode: "ask-on-write";
+  approval_mode: ApprovalMode;
   active_provider_profile: string | null;
   default_provider_profile: string | null;
   available_models: string[];
@@ -2016,6 +2266,15 @@ function buildSettingsPayload(
     credential_mode: "plain" | "secret_ref" | "unset";
     credential_ref: string | null;
   }>;
+  memory_backup: {
+    repository_url: string;
+    frequency: "manual" | "after_changes" | "hourly" | "daily";
+    token_configured: boolean;
+    last_save_at?: string;
+    last_attempt_at?: string;
+    last_result: "never" | "success" | "failed";
+    last_error: string | null;
+  } | null;
 } {
   const profiles = listProviderProfiles(adapterConfig);
   const providerProfilePayload = profiles.map((profile) => {
@@ -2043,10 +2302,9 @@ function buildSettingsPayload(
   const activeProfileEntry = activeProfileId
     ? providerProfilePayload.find((p) => p.id === activeProfileId)
     : null;
-  const effectiveDefaultModel =
-    (activeProfileId ? preferences.provider_default_models?.[activeProfileId] : undefined) ??
-    activeProfileEntry?.model ??
-    preferences.default_model;
+  const effectiveDefaultModel = activeProfileId
+    ? (preferences.provider_default_models?.[activeProfileId] ?? activeProfileEntry?.model ?? "")
+    : preferences.default_model;
 
   const availableModels = Array.from(
     new Set(
@@ -2055,6 +2313,7 @@ function buildSettingsPayload(
       )
     )
   );
+  const memoryBackup = preferences.memory_backup;
 
   return {
     default_model: effectiveDefaultModel,
@@ -2063,6 +2322,17 @@ function buildSettingsPayload(
     default_provider_profile: adapterConfig.default_provider_profile ?? null,
     available_models: availableModels,
     provider_profiles: providerProfilePayload,
+    memory_backup: memoryBackup
+      ? {
+          repository_url: memoryBackup.repository_url,
+          frequency: memoryBackup.frequency,
+          token_configured: memoryBackup.token_secret_ref.trim().length > 0,
+          ...(memoryBackup.last_save_at ? { last_save_at: memoryBackup.last_save_at } : {}),
+          ...(memoryBackup.last_attempt_at ? { last_attempt_at: memoryBackup.last_attempt_at } : {}),
+          last_result: memoryBackup.last_result ?? "never",
+          last_error: memoryBackup.last_error ?? null,
+        }
+      : null,
   };
 }
 

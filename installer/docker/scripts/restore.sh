@@ -18,6 +18,41 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
+source "${SCRIPT_DIR}/browser-helper.sh"
+
+get_env_value() {
+  local key="$1"
+  if [[ ! -f .env ]]; then
+    return 0
+  fi
+  local line
+  line="$(grep -E "^${key}=" .env | head -n 1 || true)"
+  echo "${line#*=}"
+}
+
+configure_docker_platform() {
+  if [[ "${MODE}" != "quickstart" && "${MODE}" != "prod" ]]; then
+    return 0
+  fi
+
+  local configured_platform
+  configured_platform="${BRAINDRIVE_DOCKER_PLATFORM:-$(get_env_value BRAINDRIVE_DOCKER_PLATFORM | tr -d '"')}"
+  if [[ -n "${configured_platform}" ]]; then
+    export DOCKER_DEFAULT_PLATFORM="${configured_platform}"
+    echo "Using Docker platform override: ${DOCKER_DEFAULT_PLATFORM}"
+    return 0
+  fi
+
+  local host_os
+  local host_arch
+  host_os="$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  host_arch="$(uname -m 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  if [[ "${host_os}" == "darwin" && ( "${host_arch}" == "arm64" || "${host_arch}" == "aarch64" ) ]]; then
+    export DOCKER_DEFAULT_PLATFORM="linux/amd64"
+    echo "Apple Silicon detected; using linux/amd64 for BrainDrive prebuilt images."
+    echo "Set BRAINDRIVE_DOCKER_PLATFORM to override this behavior."
+  fi
+}
 
 if [[ ! -f "${BACKUP_FILE}" ]]; then
   echo "Backup file not found: ${BACKUP_FILE}" >&2
@@ -44,6 +79,8 @@ elif [[ "${MODE}" == "local" ]]; then
   COMPOSE_FILE="compose.local.yml"
 fi
 
+configure_docker_platform
+
 BACKUP_DIR="$(cd "$(dirname "${BACKUP_FILE}")" && pwd)"
 BACKUP_NAME="$(basename "${BACKUP_FILE}")"
 
@@ -62,3 +99,4 @@ echo "Starting stack after restore"
 docker compose -f "${COMPOSE_FILE}" up -d
 
 echo "Restore complete for ${VOLUME} from ${BACKUP_FILE}"
+braindrive_print_access_info_and_open "${MODE}" "Restore complete."

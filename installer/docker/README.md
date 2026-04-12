@@ -50,6 +50,7 @@ For a one-line, no-clone install that does not require DNS/TLS setup:
    - `http://127.0.0.1:8080`
 
 This mode uses prebuilt images and `compose.quickstart.yml`.
+Lifecycle scripts now always print the access URL and attempt a best-effort browser auto-open on the host.
 
 ## Production Bootstrap
 For real public HTTPS deployments:
@@ -74,8 +75,8 @@ For real public HTTPS deployments:
 
 `install` is first-run only. If `.env` already exists, install exits to avoid accidental account/secrets invalidation.
 
-## Local source-build mode
-For local smoke testing from source (builds images from this repo):
+## Local image mode
+For local runs on prebuilt images (stable-style HTTP on localhost):
 1. Prepare `installer/docker/.env` (as shown above).
 2. Run local mode from any supported launch point:
    - Repo root: `./scripts/install.sh local`
@@ -84,7 +85,7 @@ For local smoke testing from source (builds images from this repo):
 3. Open `http://127.0.0.1:8080` (default bind).
 4. Optional LAN access: set `BRAINDRIVE_LOCAL_BIND_HOST=0.0.0.0` in `.env`, then restart/start local mode and open `http://<this-machine-ip>:8080` from another device on your network.
 
-Local mode builds images from this repo (`Dockerfile.app` + `Dockerfile.edge`) and does not require registry pull access.
+Local mode uses prebuilt images (same image/ref controls as quickstart/prod) and does require registry pull access.
 By default, first signup is allowed from any host/IP in this installer profile (`PAA_AUTH_ALLOW_FIRST_SIGNUP_ANY_IP=true`).
 
 ## Developer hot-reload mode
@@ -140,6 +141,8 @@ docker push ghcr.io/braindriveai/braindrive-edge:v0.1.0
 
 Then set in `.env`:
 - `BRAINDRIVE_TAG=v0.1.0`
+- Optional platform override (quickstart/prod image modes):
+  - `BRAINDRIVE_DOCKER_PLATFORM=linux/amd64`
 
 Optional (recommended for production): pin immutable image refs by digest in `.env`:
 - `BRAINDRIVE_APP_REF=ghcr.io/braindriveai/braindrive-app@sha256:<digest>`
@@ -147,6 +150,8 @@ Optional (recommended for production): pin immutable image refs by digest in `.e
 
 If you set one `*_REF`, set both.
 When refs are set, compose uses them instead of `BRAINDRIVE_*_IMAGE + BRAINDRIVE_TAG`.
+On Apple Silicon macOS, shell scripts automatically default quickstart/prod image runs to
+`linux/amd64` when no explicit platform override is set.
 
 Optional manifest-driven digest resolution (for upgrades):
 - `BRAINDRIVE_RELEASE_MANIFEST=./release-cache/releases.json`
@@ -169,21 +174,23 @@ If signature verification is required, upgrade scripts run `cosign verify-blob` 
 If `cosign` is missing, upgrade scripts now auto-install it by default (`BRAINDRIVE_AUTO_INSTALL_COSIGN=true`).
 Current helper scripts use key-pair signature verification (trusted public key) without transparency log lookup.
 Upgrade now auto-fetches metadata from configured release URLs into local `release-cache` so normal users do not need manual `.env` edits for each update.
-Start in quickstart/prod now runs startup update policy checks before compose up. Settings are resolved in this order: runtime env override, persistent `/data/memory/system/config/app-config.json`, `.env`, then defaults.
+Start in quickstart/prod/local now runs startup update policy checks before compose up. Settings are resolved in this order: runtime env override, persistent `/data/memory/system/config/app-config.json`, `.env`, then defaults.
+Lifecycle scripts that start/restart services (`install`, `start`, `upgrade`, `restore`) always print the URL and attempt browser auto-open; if auto-open fails, users can still use the printed URL.
 
 ## Operations
 - Start (quickstart): `./scripts/start.sh quickstart`
   - Runs startup update check first (policy-driven), then starts containers.
 - Stop (quickstart): `./scripts/stop.sh quickstart`
 - Upgrade (quickstart): `./scripts/upgrade.sh quickstart`
-- Start (source-build local): `./scripts/start.sh local`
-- Stop (source-build local): `./scripts/stop.sh local`
+- Start (local prebuilt): `./scripts/start.sh local`
+- Stop (local prebuilt): `./scripts/stop.sh local`
 - Start (developer hot reload): `./scripts/start.sh dev`
 - Stop (developer hot reload): `./scripts/stop.sh dev`
 - Upgrade (prod): `./scripts/upgrade.sh prod`
 - Check update now (without start):
   - `./scripts/check-update.sh quickstart`
   - `./scripts/check-update.sh prod`
+  - `./scripts/check-update.sh local`
 - Fetch remote metadata now (optional manual run, also done automatically in prod/quickstart upgrade):
   - `./scripts/fetch-release-metadata.sh`
 - Upgrade with explicit refs (one-shot, without editing `.env`):
@@ -204,8 +211,8 @@ Start in quickstart/prod now runs startup update policy checks before compose up
   - Start quickstart: `./scripts/start.ps1 quickstart`
     - Runs startup update check first (policy-driven), then starts containers.
   - Stop quickstart: `./scripts/stop.ps1 quickstart`
-  - Start local source-build: `./scripts/start.ps1 local`
-  - Stop local source-build: `./scripts/stop.ps1 local`
+  - Start local prebuilt: `./scripts/start.ps1 local`
+  - Stop local prebuilt: `./scripts/stop.ps1 local`
   - Start developer hot reload: `./scripts/start.ps1 dev`
   - Stop developer hot reload: `./scripts/stop.ps1 dev`
   - Install: `./scripts/install.ps1`
@@ -213,6 +220,7 @@ Start in quickstart/prod now runs startup update policy checks before compose up
   - Check update now:
     - `./scripts/check-update.ps1 -Mode quickstart`
     - `./scripts/check-update.ps1 -Mode prod`
+    - `./scripts/check-update.ps1 -Mode local`
   - Fetch remote metadata now (optional manual run, also done automatically in prod/quickstart upgrade):
     - `./scripts/fetch-release-metadata.ps1`
     - One-shot refs:
@@ -231,6 +239,65 @@ Start in quickstart/prod now runs startup update policy checks before compose up
     - Prod: `./scripts/restore.ps1 -Target memory -BackupFile <backup-file> -Mode prod`
     - Local: `./scripts/restore.ps1 -Target memory -BackupFile <backup-file> -Mode local`
   - Reset new-user state: `./scripts/reset-new-user.ps1` (supports `-Yes` and `-FreshClone`)
+
+## Memory Backup Setup (Operator Notes)
+
+Memory backup configuration is managed in the app UI:
+
+1. Open BrainDrive at `http://127.0.0.1:8080` (or your production URL).
+2. Open **Settings -> Memory Backup**.
+3. Set `Repository URL` to an HTTPS git URL (example: `https://github.com/<org>/<repo>.git`).
+4. Set `Git Token (PAT/Classic)` and choose frequency:
+   - `Manual`
+   - `After changes`
+   - `Every hour`
+   - `Every day`
+5. Click `Save Backup Settings`, then click `Save Now` to verify first push.
+6. Confirm status fields in UI:
+   - `Last successful save`
+   - `Status` (`success`/`failed`) and error message if present
+
+Validation rules and safety:
+
+1. SSH remotes are intentionally unsupported for MVP (`git@...` / `ssh://...` rejected).
+2. Embedded credentials in URL are rejected (`https://user:pass@...`).
+3. Token is stored as vault secret reference; token plaintext is never returned in settings payload.
+
+### Restore Semantics (Memory-Only)
+
+`Restore from Backup Repo` restores memory files only.
+
+1. Restores memory snapshot from fixed backup branch `braindrive-memory-backup`.
+2. Uses staging + rollback safety so partial apply is avoided on failure.
+3. Does **not** restore secrets from git backup.
+4. Does **not** change runtime/adapter config.
+
+### PAT Scope Guidance (GitHub MVP)
+
+Use minimum required scope for pushes to your target repository:
+
+1. Private repository: `repo`
+2. Public repository only: `public_repo`
+
+### Troubleshooting Common Backup Failures
+
+1. `Authentication failed for the backup repository`
+   - Verify PAT is valid and not expired.
+   - Verify PAT scope includes required repo write access.
+   - Verify the token owner has push permission to target repo.
+2. `Backup repository was not found or is not accessible`
+   - Confirm repository URL and visibility.
+   - Confirm token owner can access that repository.
+3. `Unable to reach the backup repository URL`
+   - Verify URL host/path, DNS, outbound network, and proxy/firewall settings.
+4. `Backup branch is not available in the configured repository` (restore)
+   - Run `Save Now` first to create/sync backup branch.
+5. `memory_backup.repository_url must use https://`
+   - Replace SSH URL with HTTPS URL.
+
+For a complete local validation flow, see:
+
+- `docs/onboarding/getting-started-testing-openrouter-docker.md`
 
 ## Release helper scripts (maintainer)
 These are in `installer/docker/scripts` and intended for release operations.

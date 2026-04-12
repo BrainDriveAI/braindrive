@@ -23,6 +23,8 @@
 
 - `backup.sh`
 - `backup.ps1`
+- `browser-helper.sh`
+- `browser-helper.ps1`
 - `build-release-images.sh`
 - `build-release-images.ps1`
 - `check-update.sh`
@@ -69,7 +71,7 @@
 
 Notes:
 - `install/start/stop` support `dev`.
-- `check-update/upgrade` support `quickstart|prod|local` and intentionally skip local update checks.
+- `check-update/upgrade` support `quickstart|prod|local`.
 
 ## Script Catalog
 
@@ -91,18 +93,20 @@ Arguments:
 
 Key behavior:
 - Fails if `.env` already exists (protects existing account/secrets state).
-- `local` and `dev` build images.
-- `quickstart` and `prod` pull images.
+- `dev` builds images.
+- `quickstart`, `prod`, and `local` pull images.
+- On Apple Silicon macOS, shell install defaults quickstart/prod/local pulls to `linux/amd64` unless `BRAINDRIVE_DOCKER_PLATFORM` is set.
+- Always prints the access URL and attempts a best-effort browser auto-open on the host.
 
 Env/config touched:
-- Reads: `DOMAIN`, `BRAINDRIVE_APP_REF`, `BRAINDRIVE_EDGE_REF`, `BRAINDRIVE_LOCAL_BIND_HOST`, `BRAINDRIVE_DEV_BIND_HOST`, `BRAINDRIVE_DEV_PORT`
+- Reads: `DOMAIN`, `BRAINDRIVE_APP_REF`, `BRAINDRIVE_EDGE_REF`, `BRAINDRIVE_DOCKER_PLATFORM`, `BRAINDRIVE_LOCAL_BIND_HOST`, `BRAINDRIVE_DEV_BIND_HOST`, `BRAINDRIVE_DEV_PORT`
 - Writes: `.env`, `PAA_SECRETS_MASTER_KEY_B64` when missing
 
 ### start (`start.sh`, `start.ps1`)
 
 What it does:
 - Starts services for selected mode.
-- Runs startup update policy check for `quickstart` and `prod` before `docker compose up -d`.
+- Runs startup update policy check for `quickstart`, `prod`, and `local` before `docker compose up -d`.
 - Creates required volumes in `dev` mode.
 
 Usage:
@@ -115,9 +119,10 @@ Arguments:
 Key behavior:
 - `prod` requires `.env` and real `DOMAIN`.
 - If `check-update` returns fail-closed errors, startup halts.
+- Always prints the access URL and attempts a best-effort browser auto-open on the host.
 
 Env/config read:
-- `BRAINDRIVE_LOCAL_BIND_HOST`, `BRAINDRIVE_DEV_BIND_HOST`, `BRAINDRIVE_DEV_PORT`, `DOMAIN`
+- `BRAINDRIVE_LOCAL_BIND_HOST`, `BRAINDRIVE_DEV_BIND_HOST`, `BRAINDRIVE_DEV_PORT`, `DOMAIN`, `BRAINDRIVE_DOCKER_PLATFORM`
 
 ### stop (`stop.sh`, `stop.ps1`)
 
@@ -135,8 +140,7 @@ Arguments:
 
 What it does:
 - Performs upgrade flow for `quickstart|prod|local`.
-- `local`: rebuilds from source (`up -d --build --remove-orphans`).
-- `quickstart/prod`: fetches remote metadata, resolves target refs, validates signatures (if required), then pulls and restarts.
+- Fetches remote metadata, resolves target refs, validates signatures (if required), then pulls and restarts.
 
 Usage:
 - Shell: `./installer/docker/scripts/upgrade.sh [quickstart|prod|local]`
@@ -147,6 +151,7 @@ Arguments:
 
 Important behavior:
 - Supports dry-run check mode via `BRAINDRIVE_UPGRADE_DRY_RUN=true`.
+- After non-dry-run completion, prints the access URL and attempts a best-effort browser auto-open on the host.
 - Dry-run emits machine-readable fields:
 - `CHECK_MODE=dry-run`
 - `CHECK_TARGET_APP_REF`, `CHECK_TARGET_EDGE_REF`
@@ -160,6 +165,7 @@ Important behavior:
 Key env vars:
 - `BRAINDRIVE_UPGRADE_DRY_RUN`
 - `BRAINDRIVE_APP_REF`, `BRAINDRIVE_EDGE_REF`
+- `BRAINDRIVE_DOCKER_PLATFORM`
 - `BRAINDRIVE_APP_IMAGE`, `BRAINDRIVE_EDGE_IMAGE`, `BRAINDRIVE_TAG`
 - `BRAINDRIVE_RELEASE_MANIFEST`, `BRAINDRIVE_RELEASE_CHANNEL`, `BRAINDRIVE_RELEASE_VERSION`
 - `BRAINDRIVE_REQUIRE_MANIFEST_SIGNATURE`
@@ -171,7 +177,6 @@ Key env vars:
 
 What it does:
 - Startup policy gate for upgrades.
-- Skips in `local` mode.
 - Applies update policy using precedence:
 - Runtime env overrides
 - Persistent config (`/data/memory/system/config/app-config.json`)
@@ -321,6 +326,7 @@ Optional behavior:
 What it does:
 - Restores one volume (`memory` or `secrets`) from backup archive.
 - Brings selected stack down, restores volume contents, and starts stack again.
+- After completion, prints the access URL and attempts a best-effort browser auto-open on the host.
 
 Usage:
 - Shell: `./installer/docker/scripts/restore.sh <memory|secrets> <backup-file> [quickstart|prod|local]`
@@ -346,10 +352,6 @@ Options:
 - `--yes` / `-Yes`: skip confirmation prompt
 - `--fresh-clone` / `-FreshClone`: also remove `.env` and remove local images best effort
 - `--help` / `-h`: print usage and exit (shell script)
-
-Env vars:
-- `BRAINDRIVE_APP_IMAGE_LOCAL` (default `braindrive-app:local`)
-- `BRAINDRIVE_EDGE_IMAGE_LOCAL` (default `braindrive-edge:local`)
 
 ### build-release-images (`build-release-images.sh`, `build-release-images.ps1`)
 
@@ -457,5 +459,5 @@ Behavior:
 
 - Most scripts `cd` to `installer/docker` internally before running compose operations.
 - If running from repo root, canonical invocation should remain explicit (`./installer/docker/scripts/...`) to avoid ambiguity.
-- `start` and `install` in `quickstart/prod` are update-policy aware through `check-update`.
+- `start` in `quickstart/prod/local` is update-policy aware through `check-update`.
 - `check-update` and `upgrade` form a contract via dry-run fields and exit codes.

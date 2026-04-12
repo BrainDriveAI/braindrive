@@ -6,16 +6,20 @@ import {
   getOnboardingStatus,
   getProviderModels,
   importLibraryArchive,
+  restoreMemoryBackup,
+  runMemoryBackupNow,
   sendMessage,
+  updateMemoryBackupSettings,
   updateProviderCredential,
   type ChatEvent,
 } from "./gateway-adapter";
 
-function sseResponse(frames: string): Response {
+function sseResponse(frames: string, headers?: Record<string, string>): Response {
   return new Response(frames, {
     status: 200,
     headers: {
       "content-type": "text/event-stream",
+      ...(headers ?? {}),
     },
   });
 }
@@ -85,6 +89,48 @@ describe("gateway-adapter SSE parsing", () => {
     expect(events[0]).toMatchObject({
       type: "text-delta",
       delta: "Legacy format",
+    });
+  });
+
+  it("exposes context-window warnings from response headers", async () => {
+    const onContextWarning = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        sseResponse(
+          [
+            "event: done",
+            'data: {"finish_reason":"stop","conversation_id":"conv_3"}',
+            "",
+          ].join("\n"),
+          {
+            "x-context-window-warning": "1",
+            "x-context-window-estimated-tokens": "90000",
+            "x-context-window-budget-tokens": "100000",
+            "x-context-window-ratio": "0.9",
+            "x-context-window-threshold": "0.8",
+            "x-context-window-managed": "1",
+            "x-context-window-message": "This session is getting long.",
+          }
+        )
+      )
+    );
+
+    const events = await collectEvents(sendMessage(null, "hi", { onContextWarning }));
+    expect(events).toEqual([
+      {
+        type: "done",
+        finish_reason: "stop",
+        conversation_id: "conv_3",
+      },
+    ]);
+    expect(onContextWarning).toHaveBeenCalledWith({
+      estimated_tokens: 90000,
+      budget_tokens: 100000,
+      ratio: 0.9,
+      threshold: 0.8,
+      managed: true,
+      message: "This session is getting long.",
     });
   });
 });
@@ -173,6 +219,7 @@ describe("gateway-adapter onboarding settings", () => {
             default_provider_profile: "openrouter",
             available_models: ["openai/gpt-4o-mini"],
             provider_profiles: [],
+            memory_backup: null,
           },
           onboarding: {
             onboarding_required: false,
@@ -221,6 +268,7 @@ describe("gateway-adapter onboarding settings", () => {
             default_provider_profile: "openrouter",
             available_models: ["openai/gpt-4o-mini"],
             provider_profiles: [],
+            memory_backup: null,
           },
         }),
         {
@@ -238,6 +286,138 @@ describe("gateway-adapter onboarding settings", () => {
       expect.objectContaining({
         method: "POST",
         headers: expect.objectContaining({ "Content-Type": "application/gzip" }),
+      })
+    );
+  });
+
+  it("updates memory backup settings through the dedicated endpoint", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          default_model: "openai/gpt-4o-mini",
+          approval_mode: "ask-on-write",
+          active_provider_profile: "openrouter",
+          default_provider_profile: "openrouter",
+          available_models: ["openai/gpt-4o-mini"],
+          provider_profiles: [],
+          memory_backup: {
+            repository_url: "https://github.com/BrainDriveAI/braindrive-memory.git",
+            frequency: "manual",
+            token_configured: true,
+            last_result: "never",
+            last_error: null,
+          },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await updateMemoryBackupSettings({
+      repository_url: "https://github.com/BrainDriveAI/braindrive-memory.git",
+      frequency: "manual",
+      git_token: "ghp_test",
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/settings/memory-backup",
+      expect.objectContaining({
+        method: "PUT",
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+      })
+    );
+  });
+
+  it("triggers manual memory backup save", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          result: {
+            attempted_at: "2026-04-07T12:00:00.000Z",
+            saved_at: "2026-04-07T12:00:01.000Z",
+            result: "success",
+          },
+          settings: {
+            default_model: "openai/gpt-4o-mini",
+            approval_mode: "ask-on-write",
+            active_provider_profile: "openrouter",
+            default_provider_profile: "openrouter",
+            available_models: ["openai/gpt-4o-mini"],
+            provider_profiles: [],
+            memory_backup: {
+              repository_url: "https://github.com/BrainDriveAI/braindrive-memory.git",
+              frequency: "manual",
+              token_configured: true,
+              last_result: "success",
+              last_error: null,
+              last_save_at: "2026-04-07T12:00:01.000Z",
+            },
+          },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const payload = await runMemoryBackupNow();
+    expect(payload.result.result).toBe("success");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/settings/memory-backup/save",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+      })
+    );
+  });
+
+  it("triggers memory backup restore", async () => {
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          result: {
+            attempted_at: "2026-04-07T12:10:00.000Z",
+            restored_at: "2026-04-07T12:10:03.000Z",
+            commit: "abc123def456",
+            source_branch: "braindrive-memory-backup",
+            warnings: [],
+          },
+          settings: {
+            default_model: "openai/gpt-4o-mini",
+            approval_mode: "ask-on-write",
+            active_provider_profile: "openrouter",
+            default_provider_profile: "openrouter",
+            available_models: ["openai/gpt-4o-mini"],
+            provider_profiles: [],
+            memory_backup: {
+              repository_url: "https://github.com/BrainDriveAI/braindrive-memory.git",
+              frequency: "manual",
+              token_configured: true,
+              last_result: "success",
+              last_error: null,
+            },
+          },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const payload = await restoreMemoryBackup({ target_commit: "abc123def456" });
+    expect(payload.result.commit).toBe("abc123def456");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/settings/memory-backup/restore",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "Content-Type": "application/json" }),
       })
     );
   });

@@ -1,4 +1,10 @@
-import type { AuthContext, GatewayEngineRequest, StreamEvent, ToolExecutionResult } from "../contracts.js";
+import type {
+  ApprovalMode,
+  AuthContext,
+  GatewayEngineRequest,
+  StreamEvent,
+  ToolExecutionResult
+} from "../contracts.js";
 import type { ModelAdapter } from "../adapters/base.js";
 import { auditLog } from "../logger.js";
 import { buildToolContext } from "../tools.js";
@@ -8,6 +14,7 @@ import { ToolExecutor } from "./tool-executor.js";
 
 type LoopOptions = {
   memoryRoot: string;
+  approvalMode?: ApprovalMode;
   safetyIterationLimit?: number;
   repeatToolCallThreshold?: number;
 };
@@ -31,7 +38,7 @@ export async function* runAgentLoop(
       yield {
         type: "error",
         code: "context_overflow",
-        message: "Conversation exceeded the configured safety limit",
+        message: "This session has gotten long. Start a new conversation to continue - all your work is saved.",
       };
       return;
     }
@@ -210,7 +217,7 @@ export async function* runAgentLoop(
         continue;
       }
 
-      if (tool.requiresApproval) {
+      if (tool.requiresApproval && options.approvalMode !== "auto-approve") {
         const requestId = crypto.randomUUID();
         yield {
           type: "approval-request",

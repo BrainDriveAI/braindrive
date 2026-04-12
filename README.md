@@ -25,6 +25,7 @@ Other AI tools chat. BrainDrive partners with you to get things done.
 - **A structured path to your goals** — interview → spec → action plan → ongoing partnership
 - **Life areas built in** — Career, Relationships, Fitness, Finance, plus create your own projects
 - **Your data stays yours** — conversations, memory, and files live on your machine
+- **Memory backup modes** — push memory snapshots to your own Git repo (manual or scheduled)
 - **Any AI model** — cloud models via API, local models via Ollama, or both
 - **One install** — runs in Docker on Linux, macOS, and WSL
 - **MIT licensed** — fork it, extend it, make it yours
@@ -68,9 +69,17 @@ irm https://raw.githubusercontent.com/BrainDriveAI/BrainDrive/main/installer/boo
 5. **Plan** — the spec becomes an action plan with concrete steps, phases, and milestones.
 6. **Partner** — come back anytime. Your AI remembers everything and helps you stay on track, adjust plans, and make progress.
 
-## Architecture
+## For Developers
 
-BrainDrive implements the [Personal AI Architecture](https://github.com/BrainDriveAI/personal-ai-architecture) (PAA) — an open spec for user-owned AI systems. Every component is swappable. Your Memory is the foundation; everything else can be replaced.
+BrainDrive is built on the [Personal AI Architecture](https://github.com/Personal-AI-Architecture/the-architecture) (PAA) — an open, MIT-licensed standard for user-owned AI systems. Think of PAA as the spec and BrainDrive as the implementation. Anyone can build on the architecture; BrainDrive is our take on it.
+
+| I want to... | Start here |
+|--------------|------------|
+| **Understand the architecture** | [Personal AI Architecture](https://github.com/Personal-AI-Architecture/the-architecture) — foundation spec, component contracts, conformance tests, zero lock-in by design |
+| **Build with AI assistance** | [Architecture Primer](https://github.com/Personal-AI-Architecture/the-architecture/tree/main/docs/ai) — token-optimized reference files designed to hand directly to your AI agent. Compliance matrix, component primers, audit playbooks, canonical examples. |
+| **Hack on BrainDrive** | [CONTRIBUTING.md](CONTRIBUTING.md) — fork, build, run tests, submit a PR |
+
+## Architecture
 
 ```mermaid
 flowchart LR
@@ -105,6 +114,28 @@ The system runs as two Docker containers: an app server (Gateway + tools) and an
 
 See [`installer/docker/README.md`](installer/docker/README.md) for production deployment, Windows equivalents, and advanced operations.
 
+## Memory Backup (MVP)
+
+BrainDrive includes a local-only **Memory Backup** settings tab for backing up memory snapshots to your own HTTPS Git repository.
+
+What it supports:
+
+1. Configure repository URL, token, and frequency in **Settings -> Memory Backup**
+2. Run immediate backup with **Save Now**
+3. Run scheduled backups in `after_changes`, `hourly`, or `daily` modes
+4. Restore memory from backup branch snapshots
+
+Important safety behavior:
+
+1. Restore is **memory-only**. Secrets are not restored from git backup.
+2. Backup repository URL must be `https://` (SSH URLs are rejected).
+3. Token is stored as a vault secret reference, not plaintext preferences.
+
+Setup and validation instructions:
+
+1. Operator notes: [`installer/docker/README.md`](installer/docker/README.md)
+2. Step-by-step local test flow: [`docs/onboarding/getting-started-testing-openrouter-docker.md`](docs/onboarding/getting-started-testing-openrouter-docker.md)
+
 ## Operator Quick Usage
 
 Support bundle script:
@@ -133,7 +164,7 @@ braindrive/
 
 ## Built With
 
-- [Personal AI Architecture](https://github.com/BrainDriveAI/personal-ai-architecture) — the open foundation spec
+- [Personal AI Architecture](https://github.com/Personal-AI-Architecture/the-architecture) — the open foundation spec
 - TypeScript, Fastify, React, Tailwind CSS
 - Docker and Caddy for deployment
 - [MCP](https://modelcontextprotocol.io/) for tool integration
